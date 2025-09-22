@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "RSC-sim"
+version = "0.1.0"
+description = "RSC simulation utilities"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["RSC_sim*"]  
+
+[tool.setuptools.package-data]
+RSC_sim = ["data/*.npy"]
