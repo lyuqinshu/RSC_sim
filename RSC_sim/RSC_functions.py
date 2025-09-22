@@ -489,66 +489,85 @@ def pulse_time(axis, delta_n):
 
 
 
-
 from collections import Counter
-
-
 import matplotlib.pyplot as plt
-from collections import Counter
+from mpl_toolkits.mplot3d import Axes3D  # needed for 3D plots in some setups
 
-def plot_n_distribution(mol_list):
+def get_n_distribution(mol_list, plot=True, scatter=True):
     """
-    Plot histograms showing the distribution of vibrational quantum numbers (n)
-    separately for the x, y, and z axes in the given list of molecules.
+    Get the distribution of vibrational quantum numbers (n) separately for the x, y, and z axes,
+    and optionally plot histograms and a 3D scatter plot of the motional states.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     mol_list : list of molecule objects
         Each object must have a .n attribute, which is a list or tuple [nx, ny, nz].
-    title : str, optional
-        Title of the entire figure (default is "Histogram of n Distribution by Axis").
+    plot : bool, optional
+        If True, plot histograms of the n distributions (default: True).
+    scatter : bool, optional
+        If True, also plot a 3D scatter plot of (nx, ny, nz) for each molecule (default: True).
+
+    Returns
+    -------
+    counts_x, counts_y, counts_z : Counter
+        Frequency counts of n values for x, y, and z axes.
     """
     mol_num = 0
-    # Split n values by axis
+    # Collect n values
     n_x, n_y, n_z = [], [], []
+    states = []
     for mol in mol_list:
-        if mol.spin == 0:
-            if mol.state == 1:
-                n_vals = mol.n
-                n_x.append(n_vals[0])
-                n_y.append(n_vals[1])
-                n_z.append(n_vals[2])
-                mol_num += 1
+        if mol.spin == 0 and mol.state == 1:
+            n_vals = mol.n
+            n_x.append(n_vals[0])
+            n_y.append(n_vals[1])
+            n_z.append(n_vals[2])
+            states.append(n_vals)
+            mol_num += 1
 
     # Count frequencies
     counts_x = Counter(n_x)
     counts_y = Counter(n_y)
     counts_z = Counter(n_z)
 
-    # Determine global x-axis range
-    all_n = n_x + n_y + n_z
-    n_min, n_max = min(all_n), max(all_n)
+    if plot:
+        # Histograms
+        all_n = n_x + n_y + n_z
+        n_min, n_max = min(all_n), max(all_n)
 
-    # Plot side-by-side histograms
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
-    axes[0].bar(counts_x.keys(), counts_x.values(), color='salmon', edgecolor='black')
-    axes[0].set_title("n Distribution (X axis)")
-    axes[1].bar(counts_y.keys(), counts_y.values(), color='mediumseagreen', edgecolor='black')
-    axes[1].set_title("n Distribution (Y axis)")
-    axes[2].bar(counts_z.keys(), counts_z.values(), color='cornflowerblue', edgecolor='black')
-    axes[2].set_title("n Distribution (Z axis)")
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
+        axes[0].bar(counts_x.keys(), counts_x.values(), color='salmon', edgecolor='black')
+        axes[0].set_title("n Distribution (X axis)")
+        axes[1].bar(counts_y.keys(), counts_y.values(), color='mediumseagreen', edgecolor='black')
+        axes[1].set_title("n Distribution (Y axis)")
+        axes[2].bar(counts_z.keys(), counts_z.values(), color='cornflowerblue', edgecolor='black')
+        axes[2].set_title("n Distribution (Z axis)")
 
-    for ax in axes:
-        ax.set_xlabel("n")
-        ax.grid(True, linestyle='--', alpha=0.5)
-        ax.set_xticks(range(n_min, n_max + 1, 5))
+        for ax in axes:
+            ax.set_xlabel("n")
+            ax.grid(True, linestyle='--', alpha=0.5)
+            ax.set_xticks(range(n_min, n_max + 1, 5))
 
-    axes[0].set_ylabel("Count")
-    fig.suptitle(f'{mol_num} molecules survived')
-    plt.tight_layout()
-    plt.show()
+        axes[0].set_ylabel("Count")
+        fig.suptitle(f'{mol_num} molecules survived')
+        plt.tight_layout()
+        plt.show()
+
+    if scatter and states:
+        # 3D scatter plot
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111, projection='3d')
+        xs, ys, zs = zip(*states)
+
+        ax.scatter(xs, ys, zs, c='purple', alpha=0.7, edgecolor='k')
+        ax.set_xlabel("n_x")
+        ax.set_ylabel("n_y")
+        ax.set_zlabel("n_z")
+        ax.set_title(f"3D Scatter of Motional States ({mol_num} molecules)")
+        plt.show()
 
     return counts_x, counts_y, counts_z
+
 
 def plot_time_sequence_data(n_bar, num_survive, ground_state_count, sem):
 
