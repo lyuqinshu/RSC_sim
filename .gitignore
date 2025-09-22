@@ -22,3 +22,4 @@ dist/
 # Jupyter checkpoints
 .ipynb_checkpoints/
 
+RSC_sim/data/M_FACTOR_TABLE.npy
