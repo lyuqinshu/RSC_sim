@@ -1,12 +1,12 @@
 # Byte-compiled / cache
-__pycache__/
+RSC_sim/__pycache__/
 *.py[cod]
 *.pyo
 
 # Virtual environments
-.venv/
-venv/
-env/
+RSC_sim/.venv/
+RSC_sim/venv/
+RSC_sim/env/
 *.egg-info/
 .eggs/
 
@@ -22,3 +22,4 @@ dist/
 # Jupyter checkpoints
 .ipynb_checkpoints/
 
+RSC_sim/data/
