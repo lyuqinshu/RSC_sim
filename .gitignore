@@ -22,4 +22,3 @@ dist/
 # Jupyter checkpoints
 .ipynb_checkpoints/
 
-RSC_sim/data/
