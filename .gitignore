@@ -17,7 +17,7 @@ dist/
 # IDE/project files
 .idea/
 .vscode/
-.DS_Store
+*.DS_Store
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
