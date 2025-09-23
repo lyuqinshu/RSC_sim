@@ -33,26 +33,6 @@ with resources.files(pkg).joinpath(rel).open("rb") as f:
 
 
 
-# Experiment parameter for RSC
-# Use experiment data and expand 3 quanta for radial, 4 for axial
-
-amp_matrix = {
-    "0": [0.92],
-    "X": [0.3, 0.65, 0.65, 0.7, 0.7, 0.85],
-    "Y": [0.3, 0.65, 0.65, 0.7, 0.7, 0.85],
-    "Z": [0.14, 0.14, 0.14, 0.28, 0.28, 0.35, 0.35, 0.4, 0.4]
-}
-
-
-duration_matrix = {
-    "OP": [8e-5],
-    "CO": [1e-4],
-    "X": [5e-5, 7e-5, 7e-5, 9e-5, 9e-5, 11e-5],
-    "Y": [5e-5, 7e-5, 7e-5, 9e-5, 9e-5, 11e-5],
-    "Z": [2e-4, 2e-4, 2e-4, 5e-5, 5e-5, 7e-5, 7e-5, 9e-5, 9e-5]
-}
-
-
 def generalized_laguerre(alpha, n, x):
     L = genlaguerre(n, alpha)
     return L(x)
@@ -311,40 +291,6 @@ class molecules:
         return pump_cycle
         
 
-import numpy as np
-
-def cost_function(mol_list):
-    """
-    Compute statistics of vibrational states for surviving molecules.
-
-    Parameters:
-    - mol_list (list): List of molecule objects with .state, .spin, and .n attributes.
-
-    Returns:
-    - total_num (int): Number of surviving molecules (state=1, spin=0).
-    - n_bar (list of float): Average n along [x, y, z] axes.
-    - sem_n (list of float): Standard error of the mean for n along [x, y, z] axes.
-    """
-    surviving_n = []
-
-    for mol in mol_list:
-        if getattr(mol, 'state', None) == 1 and getattr(mol, 'spin', None) == 0:
-            surviving_n.append(mol.n)
-
-    surviving_n = np.array(surviving_n)  # shape: (num_survivors, 3)
-    total_num = len(surviving_n)
-
-    if total_num > 0:
-        n_bar = np.mean(surviving_n, axis=0).tolist()
-        sem_n = (np.std(surviving_n, axis=0, ddof=1) / np.sqrt(total_num)).tolist()
-    else:
-        n_bar = [np.nan, np.nan, np.nan]
-        sem_n = [np.nan, np.nan, np.nan]
-
-    return total_num, n_bar, sem_n
-
-
-
     
 
 def initialize_thermal(temp, n, n_max=max(n_basis), branch_ratio=branch_ratio):
@@ -381,50 +327,163 @@ def initialize_thermal(temp, n, n_max=max(n_basis), branch_ratio=branch_ratio):
 
 
 
-def apply_raman_sequence(mol_list, pulse_sequence, optical_pumping=True, print_report=False):
-    """
-    Apply a sequence of Raman transitions followed by optical pumping to a list of molecules,
-    one pulse at a time. After each pulse, count how many molecules are in motional ground state [0,0,0].
 
-    Parameters:
-    - mol_list (list of molecules): List of molecule instances.
-    - pulse_sequence (list of [axis, delta_n, t]): Raman pulse sequence.
-    - print_report (bool): Whether to print output during transitions.
-
-    Returns:
-    - n_bars (list of list): Average motional number at three axis.
-    - num_survive (list of int): Total number of molecules survived after each pulse.
-    - ground_state_counts (list of int): Number of molecules in motional ground state after each pulse.
-    - cost (float): Return the cost function which evaluates the cooling.
+def apply_raman_sequence(
+    mol_list,
+    pulse_sequence,
+    optical_pumping=True,
+    print_report=False,
+    rng=None,
+    record_all=False
+):
     """
-    num_survive = []
-    ground_state_counts = []
-    sems = []
+    Apply a Raman sequence (with optional optical pumping) to a list of molecules.
+    Tracks, at each step (including the initial pre-pulse state):
+      • rate_survive: fraction of the initial eligible cohort with state==1 and spin==0
+      • ground_state_rate: fraction of the initial eligible cohort in [0,0,0] AND eligible
+      • n_bar: mean motional quanta per axis (x,y,z) over the initial eligible cohort
+      • Bootstrap SEs for the two rates and for n_bar (per axis)
+
+    Cohort:
+      - The denominator for all rates and for n̄ is the FIXED initial eligible set:
+        molecules with state==1 and spin==0 before any pulses.
+
+    Parameters
+    ----------
+    mol_list : list[molecules]
+        Each item exposes .n (np.array([nx,ny,nz])), .state (int), .spin (int),
+        and methods Raman_transition(...) and Optical_pumping(...).
+    pulse_sequence : list[[axis, delta_n, t]]
+        Sequence of Raman pulses to apply.
+    optical_pumping : bool
+        Whether to call Optical_pumping() after each Raman pulse.
+    print_report : bool
+        Pass-through verbosity to molecule methods.
+    rng : np.random.Generator | None
+        Random generator for reproducibility.
+
+    Returns
+    -------
+    n_bars : list[np.ndarray(shape=(3,))]
+        Mean motional quanta (x,y,z) over the fixed cohort at each step.
+    rate_survive : list[float]
+        Survival fraction at each step.
+    ground_state_rate : list[float]
+        Ground-state fraction at each step.
+    se_survive : list[float]
+        Bootstrap SE of rate_survive at each step.
+    se_ground : list[float]
+        Bootstrap SE of ground_state_rate at each step.
+    se_nbar : list[np.ndarray(shape=(3,))]
+        Bootstrap SEs of n̄ per axis at each step.
+    """
+    n_boot = len(mol_list)  # number of bootstrap samples
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Build fixed initial eligible cohort (indices into mol_list)
+    initial_idxs = [i for i, mol in enumerate(mol_list) if mol.state == 1 and mol.spin == 0]
+    N0 = len(initial_idxs)
+
+    # -------- helpers over current mol_list restricted to initial cohort --------
+    def current_arrays_over_cohort():
+        """Return (surv_vec[0/1], gnd_vec[0/1], n_matrix[N0,3]) for current mol_list over initial cohort."""
+        if N0 == 0:
+            return np.array([], dtype=int), np.array([], dtype=int), np.empty((0, 3), dtype=float)
+
+        surv = np.fromiter(
+            (1 if (mol_list[i].state == 1 and mol_list[i].spin == 0) else 0 for i in initial_idxs),
+            dtype=int, count=N0
+        )
+        gnd = np.fromiter(
+            (1 if (mol_list[i].state == 1 and mol_list[i].spin == 0 and np.array_equal(mol_list[i].n, np.array([0,0,0]))) else 0
+             for i in initial_idxs),
+            dtype=int, count=N0
+        )
+        n_mat = np.vstack([mol_list[i].n for i in initial_idxs]).astype(float)  # shape (N0, 3)
+        return surv, gnd, n_mat
+
+    def bootstrap_rate_se(ind_vec):
+        """Bootstrap SE of the mean of a 0/1 indicator vector over the cohort."""
+        if N0 <= 1:
+            return 0.0
+        means = np.empty(n_boot, dtype=float)
+        for b in range(n_boot):
+            sample = rng.choice(ind_vec, size=N0, replace=True)
+            means[b] = sample.mean()
+        return float(means.std(ddof=1))
+
+    def bootstrap_nbar_se(n_mat):
+        """
+        Bootstrap SE of mean per axis from n_mat shape (N0,3).
+        Returns array of shape (3,) with SEs for x,y,z.
+        """
+        if N0 <= 1:
+            return np.zeros(3, dtype=float)
+
+        means = np.empty((n_boot, 3), dtype=float)
+        for b in range(n_boot):
+            idxs = rng.integers(0, N0, size=N0)
+            sample = n_mat[idxs, :]        # (N0, 3)
+            means[b, :] = sample.mean(axis=0)
+        return means.std(axis=0, ddof=1)
+
+    # ------------------------ storage ------------------------
+    survive_rate = []
+    ground_state_rate = []
+    se_survive = []
+    se_ground = []
     n_bars = []
+    se_nbar = []
 
-    # Append for initial molecules
-    ground_count = np.sum([mol.n == [0, 0, 0] for mol in mol_list if mol.state==1 and mol.spin==0])
-    ground_state_counts.append(ground_count)
-    n, n_bar, sem = cost_function(mol_list)
-    sems.append(sem)
-    num_survive.append(n)
-    n_bars.append(n_bar)
+    # ------------------------ initial snapshot ------------------------
+    surv_vec, gnd_vec, n_mat = current_arrays_over_cohort()
 
-    for pulse_index, (axis, delta_n, t) in tqdm(enumerate(pulse_sequence), total=len(pulse_sequence), desc="Applying pulses"):
-        for i, mol in enumerate(mol_list):
+    if N0 == 0:
+        # No eligible molecules initially: define all as zeros
+        survive_rate.append(0.0)
+        ground_state_rate.append(0.0)
+        se_survive.append(0.0)
+        se_ground.append(0.0)
+        n_bars.append(np.array([0.0, 0.0, 0.0]))
+        se_nbar.append(np.array([0.0, 0.0, 0.0]))
+    else:
+        survive_rate.append(float(surv_vec.mean()))
+        ground_state_rate.append(float(gnd_vec.mean()))
+        se_survive.append(bootstrap_rate_se(surv_vec))
+        se_ground.append(bootstrap_rate_se(gnd_vec))
+        n_bars.append(n_mat.mean(axis=0))
+        se_nbar.append(bootstrap_nbar_se(n_mat))
+
+    # ------------------------ apply pulses ------------------------
+    i = 0
+    for axis, delta_n, t in tqdm(pulse_sequence, desc="Applying pulses", total=len(pulse_sequence)):
+        for mol in mol_list:
             mol.Raman_transition(axis=axis, delta_n=delta_n, time=t, print_report=print_report)
             if optical_pumping:
                 mol.Optical_pumping(print_report=print_report)
 
-        # Count molecules in ground state after this pulse
-        ground_count = np.sum([mol.n == [0, 0, 0] for mol in mol_list if mol.state==1 and mol.spin==0])
-        ground_state_counts.append(ground_count)
-        n, n_bar, sem = cost_function(mol_list)
-        sems.append(sem)
-        num_survive.append(n)
-        n_bars.append(n_bar)
+        # Recompute stats over the same fixed cohort
+        if record_all or i == len(pulse_sequence) - 1:
+            surv_vec, gnd_vec, n_mat = current_arrays_over_cohort()
+            if N0 == 0:
+                survive_rate.append(0.0)
+                ground_state_rate.append(0.0)
+                se_survive.append(0.0)
+                se_ground.append(0.0)
+                n_bars.append(np.array([0.0, 0.0, 0.0]))
+                se_nbar.append(np.array([0.0, 0.0, 0.0]))
+            else:
+                survive_rate.append(float(surv_vec.mean()))
+                ground_state_rate.append(float(gnd_vec.mean()))
+                se_survive.append(bootstrap_rate_se(surv_vec))
+                se_ground.append(bootstrap_rate_se(gnd_vec))
+                n_bars.append(n_mat.mean(axis=0))
+                se_nbar.append(bootstrap_nbar_se(n_mat))
+        i += 1
 
-    return n_bars, num_survive, ground_state_counts, sems
+    return np.array(n_bars), np.array(survive_rate), np.array(ground_state_rate), np.array(se_nbar), np.array(se_survive), np.array(se_ground)
+
 
 
 def readout_molecule_properties(mol_list, trap_freq=trap_freq, n_max_fit=max(n_basis)):
@@ -471,21 +530,6 @@ def readout_molecule_properties(mol_list, trap_freq=trap_freq, n_max_fit=max(n_b
     return states_x, states_y, states_z, avg_n, grd_n
 
 
-
-
-# RSC pulse duration
-
-scaling_x = np.pi/0.3/(amp_matrix['X'][-2]*duration_matrix['X'][-2])
-scaling_y = np.pi/0.3/(amp_matrix['Y'][-2]*duration_matrix['Y'][-2])
-scaling_z = np.pi/0.3/(amp_matrix['Z'][-2]*duration_matrix['Z'][-2])
-
-def pulse_time(axis, delta_n):
-    if axis==0:
-        return scaling_x*amp_matrix['X'][-delta_n-1]*duration_matrix['X'][-delta_n-1]
-    if axis==1:
-        return scaling_y*amp_matrix['Y'][-delta_n-1]*duration_matrix['Y'][-delta_n-1]
-    else:
-        return scaling_z*amp_matrix['Z'][-delta_n-1]*duration_matrix['Z'][-delta_n-1]
 
 
 
