@@ -16,13 +16,18 @@ trap_freq = np.array([75e3 * 2 * np.pi, 65e3 * 2 * np.pi, 13.6e3 * 2 * np.pi])  
 k_vec = 2 * np.pi / 531e-9  # wavevector of 531 nm light
 decay_ratio = [1/3, 1/3, 1/3]  # branching ratio for mN = -1, 0, 1
 branch_ratio = 0.0064 # barnching ratio of going to a different spin manifold
+trap_depth = 0.22e-3*cts.k  # trap depth in J
+max_n = [350, 350, 350]  # max n to consider for each axis
+#max_n[2] = 200  # limit max n for z axis to 200
+LD_RES = 0.01 # resolution of LD parameter in the lookup table
 
 # angle [theta, phi] of the optical pumping light
 angle_pump_sigma=[np.pi, 0.] 
 angle_pump_pi=[np.pi/2, -np.pi/4]
 LD_raman=[0.57, 0.61, 0.62]
 # LD_raman=[0.6, 0.6, 0.6]
-n_basis = np.arange(0, 40)
+n_basis = [np.arange(0, n) for n in max_n]
+n_limit = [int(trap_depth/(cts.h*freq/(2*np.pi))) for freq in trap_freq]
 
 import importlib.resources as resources
 pkg = "RSC_sim"  # your top-level package name
@@ -38,12 +43,14 @@ def generalized_laguerre(alpha, n, x):
     return L(x)
 
 def M_factor_lookup(n_initial, n_final, ld):
-    ld_index = int(round(np.abs(ld) / 0.0001))
+    ld_index = int(round(np.abs(ld) / LD_RES))
     ld_index = min(ld_index, M_FACTOR_TABLE.shape[2] - 1)  # Clamp to max index
     return M_FACTOR_TABLE[n_initial, n_final, ld_index]
 
 
-def M_factor(n1, n2, ita=0.57):
+from scipy.special import eval_genlaguerre, gammaln
+
+def M_factor(n1, n2, eta=0.57):
     """
     Calculate the M factor for the Rabi frequency of the Raman transition between states n1 and n2
     with Lamb-Dicke parameter ita.
@@ -56,17 +63,28 @@ def M_factor(n1, n2, ita=0.57):
     Returns:
     - M (float): The M factor for the transition
     """
-    if n2 >= n1:
-        delta_n = n2 - n1
-        prefactor = np.sqrt(factorial(n1) / factorial(n2)) * ita**delta_n
-        laguerre_poly = generalized_laguerre(delta_n, n1, ita**2)
-    else:
-        delta_n = n1 - n2
-        prefactor = np.sqrt(factorial(n2) / factorial(n1)) * ita**delta_n
-        laguerre_poly = generalized_laguerre(delta_n, n2, ita**2)
+    if n1 < 0 or n2 < 0:
+        raise ValueError("n1, n2 must be nonnegative")
 
-    M = prefactor * np.exp(-ita**2 / 2) * laguerre_poly
-    return M
+    # exact η=0 case: carrier only
+    if eta == 0.0:
+        return 1.0 if n1 == n2 else 0.0
+
+    # tiny-eta guard to avoid log(0) while keeping correct limit
+    # (optional; you can omit if you never pass tiny positive values)
+    if eta < 1e-300:
+        return 1.0 if n1 == n2 else 0.0
+
+    if n2 >= n1:
+        delta = n2 - n1
+        log_pref = 0.5*(gammaln(n1 + 1) - gammaln(n2 + 1)) + delta*np.log(eta)
+        L = eval_genlaguerre(n1, delta, eta*eta)
+    else:
+        delta = n1 - n2
+        log_pref = 0.5*(gammaln(n2 + 1) - gammaln(n1 + 1)) + delta*np.log(eta)
+        L = eval_genlaguerre(n2, delta, eta*eta)
+
+    return np.exp(-0.5*eta*eta + log_pref) * L
 
 def LD_par_angle(LD0, angle_pump, theta_scatter):
     """
@@ -170,11 +188,14 @@ class molecules:
         - state (int): Initial mN state (-1, 0, 1)
         - n (list): Initial quantum numbers for x, y, z axis
         - spin (int): Initial spin manifold, 0 for (mS, mI) = (-1/2, -1/2), 1 for other
+        - branch_ratio (float): Branching ratio to a different spin manifold during optical pumping
+        - islost (bool): Whether the molecule is lost (default: False)
         """
         self.state = state
         self.n = n
         self.spin = spin
         self.branch_ratio = branch_ratio
+        self.islost = False
 
     def Raman_transition(self, axis=0, delta_n=-1, time=1., print_report=True):
         """
@@ -206,6 +227,10 @@ class molecules:
         if self.spin != 0:
             return 4
         
+        # Fail if the molecule is lost
+        if self.islost:
+            return 5
+        
         # Calculate the probability of the Raman transition
         # prob = np.sin(M_factor(n_initial, n_final, LD_raman[axis])*time/2)**2
         prob = np.sin(M_factor_lookup(n_initial, n_final, LD_raman[axis])*time/2)**2
@@ -235,9 +260,13 @@ class molecules:
         pump_cycle = 0
         if self.state == 1:
             return pump_cycle
+        if self.islost:
+                return pump_cycle
         
         while self.state != 1:
             if self.spin != 0:
+                break
+            if self.islost:
                 break
             # Choose random angle for spontaneous emission [theta, phi]
             scatter_angle = [np.pi*np.random.random(), 2*np.pi*np.random.random()]
@@ -254,7 +283,7 @@ class molecules:
                 probs = []
                 ld = convert_to_LD(dK[axis], trap_freq[axis])
                 # print(f'LD par at axis {axis} = {ld:.3f}')
-                for n_final in n_basis:
+                for n_final in n_basis[axis]:
                     # Probability of the transition is propotional to rabi_freq**2
                     rabi_freq = M_factor_lookup(n_initial, n_final, ld)
                     # rabi_freq = M_factor(n_initial, n_final, ld)
@@ -264,8 +293,15 @@ class molecules:
                 probs /= probs.sum()
                 # formatted_probs = [f"{prob:.3f}" for prob in probs]
                 # print(f'Transition probabilities: {formatted_probs}')
-                n_final = np.random.choice(list(n_basis), p=probs)
+                n_final = np.random.choice(list(n_basis[axis]), p=probs)
                 self.n[axis] = n_final
+
+                # check if the molecule is lost
+                if n_final >= n_limit[axis]:
+                    self.islost = True
+                    if print_report:
+                        print(f"Molecule lost after OP, motional state {self.n}, internal state {self.state}")
+
             # Randomly set mN state according to decay_ratio
             self.state = np.random.choice([-1, 0, 1], p=decay_ratio)
             # Randomly set spin manifold according to branch_ratio
@@ -293,7 +329,7 @@ class molecules:
 
     
 
-def initialize_thermal(temp, n, n_max=max(n_basis), branch_ratio=branch_ratio):
+def initialize_thermal(temp, n, branch_ratio=branch_ratio):
     """
     Initialize a list of molecules with motional quantum states sampled from
     a Boltzmann distribution at temperature `temp`.
@@ -301,7 +337,6 @@ def initialize_thermal(temp, n, n_max=max(n_basis), branch_ratio=branch_ratio):
     Parameters:
     - temp (list): List of temperatures in Kelvin at three axes.
     - n (int): Number of molecules to initialize.
-    - n_max (int): Maximum quantum number to consider in the distribution.
 
     Returns:
     - mol_list (list of molecules): List of initialized molecule objects.
@@ -310,15 +345,17 @@ def initialize_thermal(temp, n, n_max=max(n_basis), branch_ratio=branch_ratio):
     hbar = cts.hbar
 
     mol_list = []
-    ns = np.arange(n_max)
+    ns = []
+    for i, n_m in enumerate(trap_freq):
+        ns.append(np.arange(n_limit[i]+1))
 
     for _ in range(n):
         n_thermal = []
         for i, omega in enumerate(trap_freq):
-            energies = (ns + 0.5) * hbar * omega
+            energies = (ns[i] + 0.5) * hbar * omega
             probs = np.exp(-energies / (k_B * temp[i]))
             probs /= probs.sum()  # normalize
-            sampled_n = np.random.choice(ns, p=probs)
+            sampled_n = np.random.choice(ns[i], p=probs)
             n_thermal.append(sampled_n)
         mol = molecules(state=1, n=n_thermal, branch_ratio=branch_ratio)
         mol_list.append(mol)
@@ -381,27 +418,38 @@ def apply_raman_sequence(
     if rng is None:
         rng = np.random.default_rng()
 
-    # Build fixed initial eligible cohort (indices into mol_list)
-    initial_idxs = [i for i, mol in enumerate(mol_list) if mol.state == 1 and mol.spin == 0]
+    # Build fixed initial eligible cohort (all molecules)
+    initial_idxs = [i for i, mol in enumerate(mol_list)]
     N0 = len(initial_idxs)
 
     # -------- helpers over current mol_list restricted to initial cohort --------
     def current_arrays_over_cohort():
-        """Return (surv_vec[0/1], gnd_vec[0/1], n_matrix[N0,3]) for current mol_list over initial cohort."""
-        if N0 == 0:
-            return np.array([], dtype=int), np.array([], dtype=int), np.empty((0, 3), dtype=float)
+        """
+        Return:
+        surv_vec: (N0,) 1 if still eligible (state==1, spin==0, not lost), else 0
+        gnd_vec:  (N0,) 1 if eligible AND in [0,0,0], else 0
+        and_vec:  (N0,) surv_vec & gnd_vec  (1 only if both conditions are true)
+        n_matrix: (N0,3) current n for each from the initial cohort
+        """
 
-        surv = np.fromiter(
-            (1 if (mol_list[i].state == 1 and mol_list[i].spin == 0) else 0 for i in initial_idxs),
+        surv_vec = np.fromiter(
+            (1 if (mol_list[i].state == 1 and mol_list[i].spin == 0 and not mol_list[i].islost) else 0
+            for i in initial_idxs),
             dtype=int, count=N0
         )
-        gnd = np.fromiter(
-            (1 if (mol_list[i].state == 1 and mol_list[i].spin == 0 and np.array_equal(mol_list[i].n, np.array([0,0,0]))) else 0
-             for i in initial_idxs),
+
+        gnd_vec = np.fromiter(
+            (1 if (surv_vec[i]==1 and np.array_equal(mol_list[i].n, np.array([0, 0, 0])))
+            else 0
+            for i in initial_idxs),
             dtype=int, count=N0
         )
-        n_mat = np.vstack([mol_list[i].n for i in initial_idxs]).astype(float)  # shape (N0, 3)
-        return surv, gnd, n_mat
+
+        # current n for everyone in the initial cohort (lost ones just keep last n)
+        n_matrix = np.vstack([mol_list[i].n for i in initial_idxs]).astype(float)
+
+        return surv_vec, gnd_vec, n_matrix
+
 
     def bootstrap_rate_se(ind_vec):
         """Bootstrap SE of the mean of a 0/1 indicator vector over the cohort."""
@@ -486,51 +534,6 @@ def apply_raman_sequence(
 
 
 
-def readout_molecule_properties(mol_list, trap_freq=trap_freq, n_max_fit=max(n_basis)):
-    """
-    Analyze motional states from a list of molecules that survived and fit effective temperatures.
-
-    Parameters:
-    -----------
-    mol_list : list
-        List of molecule objects to analyze. Each molecule must have attributes:
-        - n : list or array-like of [nx, ny, nz]
-        - spin : integer
-    trap_freq : ndarray
-        Trap frequencies [ω_x, ω_y, ω_z] in rad/s.
-    n_max_fit : int
-        Maximum quantum number to include in fit (currently unused in this function).
-
-    Returns:
-    --------
-    states_x, states_y, states_z : ndarray
-        Arrays of motional quantum numbers along x, y, and z for spin=0 molecules.
-    avg_n : list of float
-        Average motional quantum number along [x, y, z] axes.
-    grd_n : int
-        Number of molecules in the motional ground state (n=[0,0,0], spin=0).
-    """
-    kB = cts.k
-    hbar = cts.hbar
-
-    # Filter spin=0 molecules
-    mol_spin0 = [mol for mol in mol_list if mol.spin == 0]
-
-    # Extract motional quantum numbers
-    states_x = np.array([mol.n[0] for mol in mol_spin0])
-    states_y = np.array([mol.n[1] for mol in mol_spin0])
-    states_z = np.array([mol.n[2] for mol in mol_spin0])
-
-    # Average motional excitation per axis
-    avg_n = [np.mean(states_x), np.mean(states_y), np.mean(states_z)]
-
-    # Count motional ground state molecules (n = [0,0,0])
-    grd_n = sum(1 for mol in mol_spin0 if mol.n[0] == 0 and mol.n[1] == 0 and mol.n[2] == 0)
-
-    return states_x, states_y, states_z, avg_n, grd_n
-
-
-
 
 
 from collections import Counter
@@ -561,7 +564,7 @@ def get_n_distribution(mol_list, plot=True, scatter=True):
     n_x, n_y, n_z = [], [], []
     states = []
     for mol in mol_list:
-        if mol.spin == 0 and mol.state == 1:
+        if mol.spin == 0 and mol.state == 1 and not mol.islost:
             n_vals = mol.n
             n_x.append(n_vals[0])
             n_y.append(n_vals[1])
@@ -576,26 +579,38 @@ def get_n_distribution(mol_list, plot=True, scatter=True):
 
     if plot:
         # Histograms
-        all_n = n_x + n_y + n_z
-        n_min, n_max = min(all_n), max(all_n)
-
         fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
-        axes[0].bar(counts_x.keys(), counts_x.values(), color='salmon', edgecolor='black')
+
+        # X axis
+        axes[0].bar(counts_x.keys(), counts_x.values(),
+                    color='salmon', edgecolor='black')
         axes[0].set_title("n Distribution (X axis)")
-        axes[1].bar(counts_y.keys(), counts_y.values(), color='mediumseagreen', edgecolor='black')
+        max_x = max(counts_x.keys()) if counts_x else 0
+        axes[0].set_xticks(np.linspace(0, max_x, 10, dtype=int))
+
+        # Y axis
+        axes[1].bar(counts_y.keys(), counts_y.values(),
+                    color='mediumseagreen', edgecolor='black')
         axes[1].set_title("n Distribution (Y axis)")
-        axes[2].bar(counts_z.keys(), counts_z.values(), color='cornflowerblue', edgecolor='black')
+        max_y = max(counts_y.keys()) if counts_y else 0
+        axes[1].set_xticks(np.linspace(0, max_y, 10, dtype=int))
+
+        # Z axis
+        axes[2].bar(counts_z.keys(), counts_z.values(),
+                    color='cornflowerblue', edgecolor='black')
         axes[2].set_title("n Distribution (Z axis)")
+        max_z = max(counts_z.keys()) if counts_z else 0
+        axes[2].set_xticks(np.linspace(0, max_z, 10, dtype=int))
 
         for ax in axes:
             ax.set_xlabel("n")
             ax.grid(True, linestyle='--', alpha=0.5)
-            ax.set_xticks(range(n_min, n_max + 1, 5))
 
         axes[0].set_ylabel("Count")
-        fig.suptitle(f'{mol_num} molecules survived')
+        fig.suptitle(f"{mol_num} molecules survived")
         plt.tight_layout()
         plt.show()
+
 
     if scatter and states:
         # 3D scatter plot
@@ -613,40 +628,33 @@ def get_n_distribution(mol_list, plot=True, scatter=True):
     return counts_x, counts_y, counts_z
 
 
-def plot_time_sequence_data(n_bar, num_survive, ground_state_count, sem):
+def plot_time_sequence_data(n_bar, num_survive, ground_state_count, n_err, num_err, ground_err):
 
-    fig, axs = plt.subplots(1, 4, figsize=(20, 4))
+    fig, axs = plt.subplots(1, 3, figsize=(20, 4))
 
     # Plot 1: Ground state count
-    axs[0].plot(range(len(ground_state_count)), ground_state_count, marker='o')
+    axs[0].errorbar(range(len(ground_state_count)), ground_state_count, ground_err, marker='o')
     axs[0].set_title("3D Ground State Count")
     axs[0].set_xlabel("Pulse #")
     axs[0].set_ylabel("# in [0,0,0]")
     axs[0].grid(True)
 
-    # Plot 2: Standard error
+    # Plot 2: N_bar
     for i in [0, 1, 2]:
-        axs[1].plot(range(len(sem)), np.array(sem)[:, i], marker='o', label=f'axis {i}')
-    axs[1].set_title("Standard error")
+        axs[1].errorbar(range(len(n_bar)), np.array(n_bar)[:, i], np.array(n_err)[:, i], marker='o', label=f'axis {i}')
+    axs[1].set_title("N_bar")
     axs[1].set_xlabel("Pulse #")
     axs[1].set_ylabel("Standard error")
     axs[1].grid(True)
+    axs[1].legend()
 
     # Plot 3: Molecules Survived
-    axs[2].plot(range(len(num_survive)), num_survive, marker='o')
+    axs[2].errorbar(range(len(num_survive)), num_survive, num_err, marker='o')
     axs[2].set_title("Surviving Molecules")
     axs[2].set_xlabel("Pulse #")
     axs[2].set_ylabel("Survivors")
     axs[2].grid(True)
 
-    # Plot 4: Average n per axis
-    for i in [0, 1, 2]:
-        axs[3].plot(range(len(n_bar)), np.array(n_bar)[:, i], marker='o', label=f'axis {i}')
-    axs[3].set_title("Avg. Motional n")
-    axs[3].set_xlabel("Pulse #")
-    axs[3].set_ylabel("⟨n⟩")
-    axs[3].legend()
-    axs[3].grid(True)
 
     plt.tight_layout()
     plt.show()
