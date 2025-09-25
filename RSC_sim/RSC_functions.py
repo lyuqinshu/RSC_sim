@@ -365,173 +365,231 @@ def initialize_thermal(temp, n, branch_ratio=branch_ratio):
 
 
 
+import os, time, random
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Optional
+
+# ---------- worker init & helpers ----------
+
+def _init_worker(base_seed=None):
+    pid = os.getpid()
+    seed = (int(base_seed) if base_seed is not None else int(time.time())) ^ (pid & 0xFFFFFFFF)
+    np.random.seed(seed); random.seed(seed)
+
+def _snapshot_for_molecule(mol):
+    eligible = (mol.state == 1) and (mol.spin == 0) and (not getattr(mol, "islost", False))
+    surv = 1 if eligible else 0
+    gnd  = 1 if (eligible and np.array_equal(np.array(mol.n), np.array([0,0,0]))) else 0
+    n_vec = np.array(mol.n, dtype=float)
+    return surv, gnd, n_vec
+
+def _run_one_molecule_all_pulses_with_index(
+    idx, mol, pulse_sequence, optical_pumping,
+    print_report_in_worker, include_initial_snapshot, record_all
+):
+    """Run all pulses for one molecule and return (idx, surv(T,), gnd(T,), n_mat(T,3), UPDATED mol)."""
+    surv_list, gnd_list, n_list = [], [], []
+
+    # Initial snapshot
+    if include_initial_snapshot:
+        s, g, n = _snapshot_for_molecule(mol)
+        surv_list.append(s); gnd_list.append(g); n_list.append(n)
+
+    # Run through all pulses
+    for pi, (axis, delta_n, t) in enumerate(pulse_sequence):
+        mol.Raman_transition(axis=int(axis), delta_n=int(delta_n), time=float(t),
+                             print_report=print_report_in_worker)
+        if optical_pumping:
+            mol.Optical_pumping(print_report=print_report_in_worker)
+
+        if record_all or (pi == len(pulse_sequence) - 1):
+            # Record either every pulse or just the last one
+            s, g, n = _snapshot_for_molecule(mol)
+            surv_list.append(s); gnd_list.append(g); n_list.append(n)
+
+    return (
+        idx,
+        np.asarray(surv_list, dtype=float),
+        np.asarray(gnd_list, dtype=float),
+        np.vstack(n_list).astype(float),
+        mol,   # return the updated molecule
+    )
+
+# ---------- parallel bootstrap helpers (per timestep mapping) ----------
+
+def _rate_se_for_column(args):
+    """Compute bootstrap SE for a single time column of a 0/1 indicator vector."""
+    col, n_boot, seed = args  # col shape (N,)
+    N = col.shape[0]
+    rng = np.random.default_rng(seed)
+    idxs = rng.integers(0, N, size=(n_boot, N))
+    means = col[idxs].mean(axis=1)
+    return float(means.std(ddof=1))
+
+def _nbar_se_for_time(args):
+    """Compute bootstrap SE (x,y,z) for a single timestep n-matrix (N,3)."""
+    n_mat_t, n_boot, seed = args  # n_mat_t shape (N,3)
+    N = n_mat_t.shape[0]
+    rng = np.random.default_rng(seed)
+    idxs = rng.integers(0, N, size=(n_boot, N))
+    # sample -> (n_boot, N, 3) -> means (n_boot,3)
+    means = n_mat_t[idxs, :].mean(axis=1)
+    se = means.std(axis=0, ddof=1)
+    return se.astype(float)
+
+def _bootstrap_rate_se_over_time_parallel(ind_matrix: np.ndarray,
+                                          base_seed: Optional[int],
+                                          max_workers: Optional[int]):
+    """
+    ind_matrix: (N, T) of 0/1 indicators.
+    Returns SE over time: (T,)
+    """
+    N, T = ind_matrix.shape
+    if N <= 1:
+        return np.zeros(T, dtype=float)
+    n_boot = N
+    if max_workers is None:
+        max_workers = os.cpu_count() or 4
+    # Prepare args per timestep (avoid reusing the same seed)
+    args = [(ind_matrix[:, t], n_boot, (None if base_seed is None else base_seed + t)) for t in range(T)]
+    ses = np.empty(T, dtype=float)
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(base_seed,)) as ex:
+        for t, se_t in enumerate(ex.map(_rate_se_for_column, args, chunksize=max(1, T // (max_workers*2)))):
+            ses[t] = se_t
+    return ses
+
+def _bootstrap_nbar_se_over_time_parallel(n_tensor: np.ndarray,
+                                          base_seed: Optional[int],
+                                          max_workers: Optional[int]):
+    """
+    n_tensor: (N, T, 3)
+    Returns SE over time: (T, 3)
+    """
+    N, T, _ = n_tensor.shape
+    if N <= 1:
+        return np.zeros((T, 3), dtype=float)
+    n_boot = N
+    if max_workers is None:
+        max_workers = os.cpu_count() or 4
+    args = [(n_tensor[:, t, :], n_boot, (None if base_seed is None else base_seed + 10_000 + t)) for t in range(T)]
+    se = np.empty((T, 3), dtype=float)
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(base_seed,)) as ex:
+        for t, se_t in enumerate(ex.map(_nbar_se_for_time, args, chunksize=max(1, T // (max_workers*2)))):
+            se[t, :] = se_t
+    return se
+
+# ---------- main API (updates mol_list in-place) ----------
+
 def apply_raman_sequence(
     mol_list,
     pulse_sequence,
     optical_pumping=True,
-    print_report=False,
     rng=None,
-    record_all=False
+    max_workers=None,
+    worker_seed=None,
+    include_initial_snapshot=True,
+    record_all=False,  
+    boot_max_workers=None,
+    boot_worker_seed=None,
 ):
     """
-    Apply a Raman sequence (with optional optical pumping) to a list of molecules.
-    Tracks, at each step (including the initial pre-pulse state):
-      • rate_survive: fraction of the initial eligible cohort with state==1 and spin==0
-      • ground_state_rate: fraction of the initial eligible cohort in [0,0,0] AND eligible
-      • n_bar: mean motional quanta per axis (x,y,z) over the initial eligible cohort
-      • Bootstrap SEs for the two rates and for n_bar (per axis)
-
-    Cohort:
-      - The denominator for all rates and for n̄ is the FIXED initial eligible set:
-        molecules with state==1 and spin==0 before any pulses.
-
-    Parameters
-    ----------
-    mol_list : list[molecules]
-        Each item exposes .n (np.array([nx,ny,nz])), .state (int), .spin (int),
-        and methods Raman_transition(...) and Optical_pumping(...).
-    pulse_sequence : list[[axis, delta_n, t]]
-        Sequence of Raman pulses to apply.
-    optical_pumping : bool
-        Whether to call Optical_pumping() after each Raman pulse.
-    print_report : bool
-        Pass-through verbosity to molecule methods.
-    rng : np.random.Generator | None
-        Random generator for reproducibility.
-
-    Returns
-    -------
-    n_bars : list[np.ndarray(shape=(3,))]
-        Mean motional quanta (x,y,z) over the fixed cohort at each step.
-    rate_survive : list[float]
-        Survival fraction at each step.
-    ground_state_rate : list[float]
-        Ground-state fraction at each step.
-    se_survive : list[float]
-        Bootstrap SE of rate_survive at each step.
-    se_ground : list[float]
-        Bootstrap SE of ground_state_rate at each step.
-    se_nbar : list[np.ndarray(shape=(3,))]
-        Bootstrap SEs of n̄ per axis at each step.
+    - Each worker runs one molecule through all pulses.
+    - If record_all=True: stats after every pulse (+ initial snapshot if enabled).
+    - If record_all=False: only stats at t=0 and final state.
+    - Updated molecules are written back into mol_list.
+    - Returns aggregated arrays over the fixed cohort.
     """
-    n_boot = len(mol_list)  # number of bootstrap samples
     if rng is None:
         rng = np.random.default_rng()
 
-    # Build fixed initial eligible cohort (all molecules)
-    initial_idxs = [i for i, mol in enumerate(mol_list)]
-    N0 = len(initial_idxs)
-
-    # -------- helpers over current mol_list restricted to initial cohort --------
-    def current_arrays_over_cohort():
-        """
-        Return:
-        surv_vec: (N0,) 1 if still eligible (state==1, spin==0, not lost), else 0
-        gnd_vec:  (N0,) 1 if eligible AND in [0,0,0], else 0
-        and_vec:  (N0,) surv_vec & gnd_vec  (1 only if both conditions are true)
-        n_matrix: (N0,3) current n for each from the initial cohort
-        """
-
-        surv_vec = np.fromiter(
-            (1 if (mol_list[i].state == 1 and mol_list[i].spin == 0 and not mol_list[i].islost) else 0
-            for i in initial_idxs),
-            dtype=int, count=N0
-        )
-
-        gnd_vec = np.fromiter(
-            (1 if (surv_vec[i]==1 and np.array_equal(mol_list[i].n, np.array([0, 0, 0])))
-            else 0
-            for i in initial_idxs),
-            dtype=int, count=N0
-        )
-
-        # current n for everyone in the initial cohort (lost ones just keep last n)
-        n_matrix = np.vstack([mol_list[i].n for i in initial_idxs]).astype(float)
-
-        return surv_vec, gnd_vec, n_matrix
-
-
-    def bootstrap_rate_se(ind_vec):
-        """Bootstrap SE of the mean of a 0/1 indicator vector over the cohort."""
-        if N0 <= 1:
-            return 0.0
-        means = np.empty(n_boot, dtype=float)
-        for b in range(n_boot):
-            sample = rng.choice(ind_vec, size=N0, replace=True)
-            means[b] = sample.mean()
-        return float(means.std(ddof=1))
-
-    def bootstrap_nbar_se(n_mat):
-        """
-        Bootstrap SE of mean per axis from n_mat shape (N0,3).
-        Returns array of shape (3,) with SEs for x,y,z.
-        """
-        if N0 <= 1:
-            return np.zeros(3, dtype=float)
-
-        means = np.empty((n_boot, 3), dtype=float)
-        for b in range(n_boot):
-            idxs = rng.integers(0, N0, size=N0)
-            sample = n_mat[idxs, :]        # (N0, 3)
-            means[b, :] = sample.mean(axis=0)
-        return means.std(axis=0, ddof=1)
-
-    # ------------------------ storage ------------------------
-    survive_rate = []
-    ground_state_rate = []
-    se_survive = []
-    se_ground = []
-    n_bars = []
-    se_nbar = []
-
-    # ------------------------ initial snapshot ------------------------
-    surv_vec, gnd_vec, n_mat = current_arrays_over_cohort()
+    N0 = len(mol_list)
+    P = len(pulse_sequence)
+    if record_all:
+        T = (1 + P) if include_initial_snapshot else P
+    else:
+        # only initial and final
+        T = 2 if include_initial_snapshot else 1
 
     if N0 == 0:
-        # No eligible molecules initially: define all as zeros
-        survive_rate.append(0.0)
-        ground_state_rate.append(0.0)
-        se_survive.append(0.0)
-        se_ground.append(0.0)
-        n_bars.append(np.array([0.0, 0.0, 0.0]))
-        se_nbar.append(np.array([0.0, 0.0, 0.0]))
-    else:
-        survive_rate.append(float(surv_vec.mean()))
-        ground_state_rate.append(float(gnd_vec.mean()))
-        se_survive.append(bootstrap_rate_se(surv_vec))
-        se_ground.append(bootstrap_rate_se(gnd_vec))
-        n_bars.append(n_mat.mean(axis=0))
-        se_nbar.append(bootstrap_nbar_se(n_mat))
+        zeros_T = np.zeros(T, dtype=float)
+        zeros_T3 = np.zeros((T,3), dtype=float)
+        return zeros_T3, zeros_T, zeros_T, zeros_T3, zeros_T, zeros_T
 
-    # ------------------------ apply pulses ------------------------
-    i = 0
-    for axis, delta_n, t in tqdm(pulse_sequence, desc="Applying pulses", total=len(pulse_sequence)):
-        for mol in mol_list:
-            mol.Raman_transition(axis=axis, delta_n=delta_n, time=t, print_report=print_report)
-            if optical_pumping:
-                mol.Optical_pumping(print_report=print_report)
+    if max_workers is None:
+        max_workers = os.cpu_count() or 4
 
-        # Recompute stats over the same fixed cohort
-        if record_all or i == len(pulse_sequence) - 1:
-            surv_vec, gnd_vec, n_mat = current_arrays_over_cohort()
-            if N0 == 0:
-                survive_rate.append(0.0)
-                ground_state_rate.append(0.0)
-                se_survive.append(0.0)
-                se_ground.append(0.0)
-                n_bars.append(np.array([0.0, 0.0, 0.0]))
-                se_nbar.append(np.array([0.0, 0.0, 0.0]))
-            else:
-                survive_rate.append(float(surv_vec.mean()))
-                ground_state_rate.append(float(gnd_vec.mean()))
-                se_survive.append(bootstrap_rate_se(surv_vec))
-                se_ground.append(bootstrap_rate_se(gnd_vec))
-                n_bars.append(n_mat.mean(axis=0))
-                se_nbar.append(bootstrap_nbar_se(n_mat))
-        i += 1
+    surv = np.empty((N0, T), dtype=float)
+    gnd  = np.empty((N0, T), dtype=float)
+    n_ts = np.empty((N0, T, 3), dtype=float)
 
-    return np.array(n_bars), np.array(survive_rate), np.array(ground_state_rate), np.array(se_nbar), np.array(se_survive), np.array(se_ground)
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_init_worker,
+        initargs=(worker_seed,)
+    ) as ex:
+        futures = [
+            ex.submit(
+                _run_one_molecule_all_pulses_with_index,
+                i, mol, pulse_sequence, bool(optical_pumping),
+                False, include_initial_snapshot, record_all
+            )
+            for i, mol in enumerate(mol_list)
+        ]
 
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Applying pulses to molecules"):
+            idx, surv_i, gnd_i, n_i, mol_updated = fut.result()
+            surv[idx, :] = surv_i
+            gnd[idx,  :] = gnd_i
+            n_ts[idx, :, :] = n_i
+            mol_list[idx] = mol_updated   # update in-place
+
+    survive_rate      = surv.mean(axis=0)
+    ground_state_rate = gnd.mean(axis=0)
+    n_bars            = n_ts.mean(axis=0)
+
+    # -------- Parallelized bootstrap SEs over time --------
+    # Use rng to derive a base seed for reproducibility if provided.
+    # (If rng is random, seeds vary; set boot_worker_seed for fixed results.)
+    base_seed = boot_worker_seed if (boot_worker_seed is not None) else int(rng.integers(0, 2**31 - 1))
+
+    se_survive = _bootstrap_rate_se_over_time_parallel(surv, base_seed, boot_max_workers)
+    se_ground  = _bootstrap_rate_se_over_time_parallel(gnd,  base_seed + 1 if base_seed is not None else None, boot_max_workers)
+    se_nbar    = _bootstrap_nbar_se_over_time_parallel(n_ts, base_seed + 2 if base_seed is not None else None, boot_max_workers)
+
+
+    return (
+        n_bars.astype(float),
+        survive_rate.astype(float),
+        ground_state_rate.astype(float),
+        se_nbar.astype(float),
+        se_survive.astype(float),
+        se_ground.astype(float),
+    )
+
+def apply_raman_pulses_serial(
+    mol,
+    pulse_sequence,
+    optical_pumping: bool = True,
+    rng=None,
+):
+    """
+    Apply a sequence of Raman pulses to a single molecule in serial.
+    """
+    import numpy as np, random
+
+    if rng is not None:
+        # Sync rng into numpy and Python's random so molecule methods
+        # using np.random/random will be reproducible
+        np.random.set_state(rng.bit_generator.state)
+        random.seed(rng.integers(0, 2**32 - 1))
+
+    for axis, delta_n, t in pulse_sequence:
+        
+        mol.Raman_transition(axis=int(axis), delta_n=int(delta_n), time=float(t), print_report=False)
+        if optical_pumping:
+            mol.Optical_pumping(print_report=False)
+
+    return mol
 
 
 
