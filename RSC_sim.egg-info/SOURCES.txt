@@ -1,7 +1,10 @@
 pyproject.toml
 ./RSC_sim/RSC_functions.py
 ./RSC_sim/__init__.py
+./RSC_sim/data_analysis.py
+./RSC_sim/generate_M.py
 ./RSC_sim/sequence_functions.py
+./RSC_sim/data/M_FACTOR_TABLE.npy
 RSC_sim/RSC_functions.py
 RSC_sim/__init__.py
 RSC_sim/sequence_functions.py

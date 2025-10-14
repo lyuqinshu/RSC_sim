@@ -6,37 +6,63 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import random
 from scipy.special import hermite, factorial
-
+import json
 from scipy.special import genlaguerre
+from .generate_M import precompute_M_factors_parallel
+from importlib.resources import files, as_file
+from pathlib import Path
+from multiprocessing import current_process
 
-# Meta parameters
+_pkg = "RSC_sim"
+_rel = "data/M_FACTOR_TABLE.npy"
+
+# ---- Load simulation parameters from config.json ----
+with open(files(_pkg).joinpath("config.json"), "r") as f:
+    _cfg = json.load(f)
+
 amu = 1.66053906660e-27  # kg
-mass = 59 * amu
-trap_freq = np.array([75e3 * 2 * np.pi, 65e3 * 2 * np.pi, 13.6e3 * 2 * np.pi])  # trap frequency for x, y, z in rad/s
-k_vec = 2 * np.pi / 531e-9  # wavevector of 531 nm light
-decay_ratio = [1/3, 1/3, 1/3]  # branching ratio for mN = -1, 0, 1
-branch_ratio = 0.0064 # barnching ratio of going to a different spin manifold
-trap_depth = 0.22e-3*cts.k  # trap depth in J
-max_n = [350, 350, 350]  # max n to consider for each axis
-#max_n[2] = 200  # limit max n for z axis to 200
-LD_RES = 0.01 # resolution of LD parameter in the lookup table
+mass = float(_cfg["mass"]*amu)
+trap_freq = np.array(_cfg["trap_freq"], dtype=float)*2*np.pi # trap frequency for x, y, z in rad/s     
+k_vec = float(2 * np.pi / _cfg["lambda"]) # wavevector of 531 nm light                        
+decay_ratio = list(map(float, _cfg["decay_ratio"])) # branching ratio for mN = -1, 0, 1
+branch_ratio = float(_cfg["branch_ratio"]) # barnching ratio of going to a different spin manifold
+trap_depth = float(_cfg["trap_depth"] * cts.k) # trap depth in J
+max_n = list(map(int, _cfg["max_n"])) # max n to consider for each axis
+LD_RES = float(_cfg["LD_RES"]) # resolution of LD parameter in the lookup table
 
 # angle [theta, phi] of the optical pumping light
-angle_pump_sigma=[np.pi, 0.] 
-angle_pump_pi=[np.pi/2, -np.pi/4]
-LD_raman=[0.57, 0.61, 0.62]
-# LD_raman=[0.6, 0.6, 0.6]
+angle_pump_sigma = list(map(float, _cfg["angle_pump_sigma"]))
+angle_pump_pi    = list(map(float, _cfg["angle_pump_pi"]))
+
+LD_raman = list(map(float, _cfg["LD_raman"]))
+
 n_basis = [np.arange(0, n) for n in max_n]
-n_limit = [int(trap_depth/(cts.h*freq/(2*np.pi))) for freq in trap_freq]
-
-import importlib.resources as resources
-pkg = "RSC_sim"  # your top-level package name
-rel = "data/M_FACTOR_TABLE.npy"
-
-with resources.files(pkg).joinpath(rel).open("rb") as f:
-    M_FACTOR_TABLE = np.load(f, allow_pickle=False)
+# trap_freq is in rad/s; convert to Hz via /(2π) for the formula
+n_limit = [int(trap_depth / (cts.h * f / (2 * np.pi))) for f in trap_freq]
 
 
+
+def _compute_m_table(target_path: Path):
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        precompute_M_factors_parallel(workers=1)
+
+
+def _load_m_table() -> np.ndarray:
+    """Load the M-factor table, computing it if it doesn't exist yet."""
+    tgt = files(_pkg).joinpath(_rel)
+    try:
+        with tgt.open("rb") as f:
+            return np.load(f, allow_pickle=False)
+    except FileNotFoundError:
+        print("M_FACTOR_TABLE.npy not found; computing it now...")
+        with as_file(tgt) as p:
+            p = Path(p)
+            _compute_m_table(p)
+            with p.open("rb") as f:
+                return np.load(f, allow_pickle=False)
+
+# Public: the lookup table
+M_FACTOR_TABLE = _load_m_table()
 
 def generalized_laguerre(alpha, n, x):
     L = genlaguerre(n, alpha)
@@ -47,44 +73,6 @@ def M_factor_lookup(n_initial, n_final, ld):
     ld_index = min(ld_index, M_FACTOR_TABLE.shape[2] - 1)  # Clamp to max index
     return M_FACTOR_TABLE[n_initial, n_final, ld_index]
 
-
-from scipy.special import eval_genlaguerre, gammaln
-
-def M_factor(n1, n2, eta=0.57):
-    """
-    Calculate the M factor for the Rabi frequency of the Raman transition between states n1 and n2
-    with Lamb-Dicke parameter ita.
-
-    Parameters:
-    - n1 (int): Initial quantum number
-    - n2 (int): Final quantum number
-    - ita (float): Lamb-Dicke parameter
-
-    Returns:
-    - M (float): The M factor for the transition
-    """
-    if n1 < 0 or n2 < 0:
-        raise ValueError("n1, n2 must be nonnegative")
-
-    # exact η=0 case: carrier only
-    if eta == 0.0:
-        return 1.0 if n1 == n2 else 0.0
-
-    # tiny-eta guard to avoid log(0) while keeping correct limit
-    # (optional; you can omit if you never pass tiny positive values)
-    if eta < 1e-300:
-        return 1.0 if n1 == n2 else 0.0
-
-    if n2 >= n1:
-        delta = n2 - n1
-        log_pref = 0.5*(gammaln(n1 + 1) - gammaln(n2 + 1)) + delta*np.log(eta)
-        L = eval_genlaguerre(n1, delta, eta*eta)
-    else:
-        delta = n1 - n2
-        log_pref = 0.5*(gammaln(n2 + 1) - gammaln(n1 + 1)) + delta*np.log(eta)
-        L = eval_genlaguerre(n2, delta, eta*eta)
-
-    return np.exp(-0.5*eta*eta + log_pref) * L
 
 def LD_par_angle(LD0, angle_pump, theta_scatter):
     """
@@ -491,6 +479,7 @@ def apply_raman_sequence(
     record_all=False,  
     boot_max_workers=None,
     boot_worker_seed=None,
+    get_sem=False
 ):
     """
     - Each worker runs one molecule through all pulses.
@@ -550,12 +539,17 @@ def apply_raman_sequence(
     # -------- Parallelized bootstrap SEs over time --------
     # Use rng to derive a base seed for reproducibility if provided.
     # (If rng is random, seeds vary; set boot_worker_seed for fixed results.)
-    base_seed = boot_worker_seed if (boot_worker_seed is not None) else int(rng.integers(0, 2**31 - 1))
+    if get_sem:
+        
+        base_seed = boot_worker_seed if (boot_worker_seed is not None) else int(rng.integers(0, 2**31 - 1))
 
-    se_survive = _bootstrap_rate_se_over_time_parallel(surv, base_seed, boot_max_workers)
-    se_ground  = _bootstrap_rate_se_over_time_parallel(gnd,  base_seed + 1 if base_seed is not None else None, boot_max_workers)
-    se_nbar    = _bootstrap_nbar_se_over_time_parallel(n_ts, base_seed + 2 if base_seed is not None else None, boot_max_workers)
-
+        se_survive = _bootstrap_rate_se_over_time_parallel(surv, base_seed, boot_max_workers)
+        se_ground  = _bootstrap_rate_se_over_time_parallel(gnd,  base_seed + 1 if base_seed is not None else None, boot_max_workers)
+        se_nbar    = _bootstrap_nbar_se_over_time_parallel(n_ts, base_seed + 2 if base_seed is not None else None, boot_max_workers)
+    else:
+        se_survive = np.zeros(T, dtype=float)
+        se_ground  = np.zeros(T, dtype=float)
+        se_nbar    = np.zeros((T, 3), dtype=float)
 
     return (
         n_bars.astype(float),
