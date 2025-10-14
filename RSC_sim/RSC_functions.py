@@ -122,33 +122,6 @@ def Delta_k(angle_pump, angle_scatter):
     return (k_vec * delta_k).tolist()
 
 
-
-def OP_prob(n1, n2, LD0=0.57, angle_pump=np.pi/4, N_theta=100):
-    """
-    Calculate the optical pumping transition probability between states n1 and n2,
-    averaging over spontaneous emission polar angle θ only (assuming azimuthal symmetry).
-
-    Parameters:
-    - n1, n2 (int): Quantum numbers
-    - LD0 (float): Base Lamb-Dicke parameter (Delta_k * z0)
-    - angle_pump (float): Pump beam polar angle (radians)
-    - N_theta (int): Number of θ points to sample
-
-    Returns:
-    - P (float): Solid-angle averaged transition probability
-    """
-    theta = np.linspace(0, np.pi, N_theta)
-    dtheta = theta[1] - theta[0]
-
-    P_total = 0.0
-    for t in theta:
-        LD = LD_par_angle(LD0, angle_pump, t)
-        P = M_factor(n1, n2, LD)**2
-        weight = np.sin(t) * dtheta * 2 * np.pi  # integrate φ analytically
-        P_total += P * weight
-
-    return P_total / (4 * np.pi)
-
 def convert_to_LD(dK, trap_f):
     """
     Convert trap frequency to Lamb-Dicke parameter.
